@@ -1,0 +1,204 @@
+---
+title: "Extreme weather events analysis"
+author: "Mikhail Slyusarev"
+date: "28 January 2016"
+output: html_document
+---
+
+In this analytic report we will explore a database of severe weather events in the U.S. during the period from 1950 through November 2011. The report is based on U.S. National Oceanic and Atmospheric Administration’s database. The goal of this exploration is to answer following questions:
+
+* **Which types of events are most harmful with respect to population health?**
+* **Which types of events have the greatest economic consequences?**
+
+We will walk through Data processing section to Results so you will see all the steps of processing the data. In the Results section you will find figures and summaries to answer the questions above.
+
+## Data processing
+
+While processing the data you will see how we obtaining it, cleaning, and summaraizing.
+
+Let's start with downloading of initial dataset. It is available as bz2 archive using this [link][wheather data] on the date of 28 Jan 2016.
+
+```{r download data, cache = TRUE}
+if ( !file.exists('weather_events.csv.bz2') ) {
+  url <- "http://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2"
+  download.file(url, 'weather_events.csv.bz2', mode="wb")
+}
+
+weather_events <- read.csv('weather_events.csv.bz2')
+```
+
+For the analysis we are going to need *dplyr* package to manipulate and clean the data.
+
+```{r plug in packages, message = FALSE}
+library(dplyr)
+```
+
+####Cut off inadequate data
+
+[According to NOAA][noaa tracking tornadoes] they only tracked tornadoes for many years from 1950 through 1954. Then they added thunderstorm wind and hail to the list. And that was all the tracking events up to January of 1996 when they started to record 48 different event types. If we don't take this information into account and continue with analysis starting from 1950 we will end up with misinterpretation of the original data set and will get wrong answers to our main questions.
+
+To avoid this mistake we have to cut off the data set and start our analisys from 1996.
+
+```{r cut off tornadoes}
+weather_events$BGN_DATE <- as.Date(weather_events$BGN_DATE, '%m/%d/%Y')
+weather_events <- weather_events[weather_events$BGN_DATE >= '1996-01-01',]
+```
+
+####Extract working sampling
+
+If we review *weather* data frame briefly we can find following information that will help us answer our questions.
+
+* EVTYPE -- Type of wheather event
+* INJURIES -- Number of injured people related to the certain event
+* FATALITIES -- Number of deaths related to the certain event
+* PROPDMG -- Number of damage to property in dollars
+* PROPDMGEXP -- Shows exponent for the damage value (K - thousands, M - millions, B - billions)
+* CROPDMG -- Crop damage information in dollars
+* CROPDMGEXP -- Same as PROPDMGEXP in respect to CROPDMG
+
+To extract and sum up this information from the original dataset we use functions from *dplyr* package. Along the way we count a number of victims as a sum of injured and dead people.
+
+```{r extract working sampling}
+harm_data <- 
+  select(weather_events, EVTYPE, FATALITIES, INJURIES, PROPDMG, PROPDMGEXP, CROPDMG, CROPDMGEXP)  %>%
+  filter(FATALITIES > 0 | INJURIES > 0 | PROPDMG > 0 | CROPDMG > 0)                               %>%
+  mutate(Victims = FATALITIES + INJURIES)                                                         %>%
+  rename(Event = EVTYPE)                                                                          
+```
+
+Now let's calculate total property damage by combining PROPDMG, PROPDMGEXP, CROPDMG, and CROPDMGEXP fields. We know that exponent fields could contain keys on how big real numbers of damage. These keys are K (thousands), M (millions), B (billions). If an exponent cell is empty we assume it is 1 to simplify calculations.
+
+```{r calculate total property damage}
+harm_data$PROPDMGEXP <- as.character(harm_data$PROPDMGEXP)
+harm_data$PROPDMGEXP[harm_data$PROPDMGEXP == '' ] <- 1
+harm_data$PROPDMGEXP[harm_data$PROPDMGEXP == 'K'] <- 1000
+harm_data$PROPDMGEXP[harm_data$PROPDMGEXP == 'M'] <- 1e+06
+harm_data$PROPDMGEXP[harm_data$PROPDMGEXP == 'B'] <- 1e+09
+harm_data$PROPDMGEXP <- as.numeric(harm_data$PROPDMGEXP)
+harm_data[is.na(harm_data$PROPDMG)] <- 0
+harm_data$Damage <- harm_data$PROPDMG * harm_data$PROPDMGEXP
+
+harm_data$CROPDMGEXP <- as.character(harm_data$CROPDMGEXP)
+harm_data$CROPDMGEXP[harm_data$CROPDMGEXP == '' ] <- 1
+harm_data$CROPDMGEXP[harm_data$CROPDMGEXP == 'K'] <- 1000
+harm_data$CROPDMGEXP[harm_data$CROPDMGEXP == 'M'] <- 1e+06
+harm_data$CROPDMGEXP[harm_data$CROPDMGEXP == 'B'] <- 1e+09
+harm_data$CROPDMGEXP <- as.numeric(harm_data$CROPDMGEXP)
+harm_data$Damage <- harm_data$Damage + harm_data$CROPDMG * harm_data$CROPDMGEXP
+```
+
+This gives us a initial sampling which we will need to clean from duplicating data.
+
+```{r first glance}
+harm_data <- select(harm_data, -FATALITIES, -INJURIES, -PROPDMG, -CROPDMG, -PROPDMGEXP, -CROPDMGEXP)
+head(harm_data)
+```
+
+####Cleaning up duplicating events
+
+We can easily get rid of exact duplicates grouping by *Event* field and using *summarise* function, so all the exact matches will collapse into a single row with summarised Victims and Damage values.
+
+```{r get rid of exact duplicates}
+harm_data$Event <- tolower(harm_data$Event)
+harm_data <- group_by(harm_data, Event) %>% summarise(Victims = sum(Victims), Damage = sum(Damage))
+head(harm_data)
+```
+
+There is still a number of duplicates that doesn't match exactly. This is either a typo in the Event name, or paraphrased names. Or it can even be an old name, like landslide was renamed to debris flow, as stated in the NOAA's documentation. I don't see any easy way to automate searching of duplicates like this, so I do that manually. 
+
+In order to make it reproducible I created a list that maps values from the working dataset onto correct names (according to NOAA documentation). So this allows you to see how exactly merging was done. And how each event name from the original sampling was joined with its duplicates.
+
+Bellow is the map and the code for eliminating duplicates.
+
+```{r collect similiar rows}
+duplicates <- list(
+  'Coastal Flood' = c('coastal flood', 'coastal flooding', 'coastal flooding/erosion', 'coastal storm', 'coastalstorm', 'hazardous surf', 'tidal flooding'),
+  'Frost/Freeze' = c('black ice', 'frost', 'glaze', 'ice on road', 'ice roads', 'icy roads'),
+  'Flash Flood' = c('flash flood'),
+  'Drought' = c('drought'),
+  'Lightning' = c('lightning'),
+  'Wildfire' = c('wildfire', 'brush fire', 'wild/forest fire'),
+  'Blizzard' = c('blizzard', 'blowing snow'),
+  'Cold/Wind Chill' = c('cold', 'cold and snow', 'cold temperature', 'cold/wind chill', 'extreme cold', 'extreme cold/wind chill', 'extreme windchill', 'cold weather', 'extended cold', 'hyperthermia/exposure', 'hypothermia/exposure'),
+  'Winter Wheather' = c('freezing drizzle', 'freezing rain', 'freezing spray', 'winter weather', 'winter weather mix', 'winter weather/mix', 'wintry mix', 'falling snow/ice', 'snow', 'snow and ice', 'snow squall', 'snow squalls', 'rain/snow', 'light snow'),
+  'Strong Wind' = c('gusty wind', 'gusty winds', 'wind', 'winds', 'strong wind', 'strong winds', 'high wind', 'non-severe wind damage', 'non tstm wind'),
+  'Tornado' = c('tornado', 'funnel cloud', 'whirlwind', 'waterspout'),
+  'Excessive Heat' = c('excessive heat', 'heat wave', 'unseasonably warm', 'record heat'),
+  'Heavy Snow' = c('heavy snow shower', 'heavy snow', 'excessive snow'),
+  'Heat' = c('heat', 'warm weather'),
+  'Thunderstorm Wind' = c('tstm wind', 'tstm wind (g35)', 'tstm wind (g40)', 'tstm wind (g45)', 'tstm wind/hail', 'thunderstorm wind', 'dry microburst', 'thunderstorm', 'thunderstorm wind (g40)'),
+  'Hail' = c('hail', 'small hail'),
+  'High Surf' = c('heavy surf', 'heavy surf and wind', 'heavy surf/high surf', 'high seas', 'high surf', 'high swells', 'high water', 'heavy seas', 'rogue wave', 'rough seas', 'rough surf'),
+  'Winter Storm' = c('winter storm'),
+  'Rip Current' = c('rip current', 'rip currents'),
+  'Heavy Rain' = c('torrential rainfall', 'heavy rain'),
+  'Hurricane/Typhoon' = c('hurricane', 'hurricane edouard', 'hurricane/typhoon'),
+  'Marine Thunderstorm Wind' = c('marine thunderstorm wind', 'marine tstm wind'),
+  'Debris Flow' = c('landslide', 'landslides', 'mudslide', 'mudslides'),
+  'Flood' = c('river flood', 'river flooding', 'flood'),
+  'Storm Surge/Tide' = c('storm surge', 'storm surge/tide')
+)
+
+remaining <- harm_data
+new <- data.frame(Event = character(0), Victims = integer(0), Damage = integer(0), stringsAsFactors = FALSE)
+for( event_name in names(duplicates) ) {
+  event_subset <- remaining[remaining$Event %in% duplicates[[event_name]], ]
+  new[nrow(new) + 1, ] <- c(event_name, sum(event_subset$Victims), sum(event_subset$Damage))
+  remaining <- remaining[! remaining$Event %in% duplicates[[event_name]], ]
+}
+
+harm_data <- rbind(new, remaining)
+harm_data$Damage <- as.numeric(harm_data$Damage)
+harm_data$Victims <- as.numeric(harm_data$Victims)
+```
+
+## Results
+
+Finally let's take a look at our results. Apperantly Tornado is the most harmful weather event across the U.S. and it brought more damage to population health then any other disaster. On the other hand there is Flooding that brings the most terrible damage to the economy of the country.
+
+You will see two barplots that will help you justify answers to the questions posed above.
+
+####Most harmful events with respect to population health
+
+It makes sense to set a treshold value for the number of victims to form a shortlist of most harmful weather events with respect to population health. We will consider only disasters that made impact on more then thousand people overall.
+
+```{r set population harm}
+population_harm <-
+  select(harm_data, Event, Victims) %>%
+  filter(Victims > 1000)            %>%
+  arrange(Victims)
+```
+
+```{r show population harm by event, fig.width=10, fig.height=5}
+par(mar=c(5,9,2,1))
+    
+barplot(population_harm$Victims, names.arg = population_harm$Event, las=1, horiz=TRUE,
+        main = 'Most harmful events with respect to population health',
+        xlab = 'Weather event victims from January 1996 to November 2011',
+        col =  '#FF8000')
+```
+
+####Most harmful events with respect to economic consequences
+
+As in previous section let's make a shortlist to display more sensible figures. This time it's in US dollars. And, having a glance look at working dataset, it seems fair to pick a 10 billion treshold.
+
+```{r set economic harm}
+economic_harm <-
+  select(harm_data, Event, Damage) %>%
+  filter(Damage > 1.0e+10)         %>%
+  arrange(Damage)
+```
+
+```{r show economic harm by event, fig.width=10, fig.height=5}
+par(mar=c(5,9,2,1))
+
+economic_harm$Damage <- economic_harm$Damage / 1.0e+9
+
+barplot(economic_harm$Damage, names.arg = economic_harm$Event, las=1, horiz=TRUE,
+        main = 'Events with the greatest economic consequences',
+        xlab = 'Weather event economic damage (in billions of USD) from January 1996 to November 2011',
+        col = '#FF8000')
+```
+
+[wheather data]:http://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2
+[noaa tracking tornadoes]:http://www.ncdc.noaa.gov/stormevents/details.jsp
